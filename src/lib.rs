@@ -20,17 +20,18 @@
 
 #![warn(missing_docs, missing_debug_implementations, rust_2018_idioms)]
 
-use std::future::Future;
-use std::marker::PhantomData;
+mod taskqueue;
 use std::panic::{RefUnwindSafe, UnwindSafe};
-use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
 use std::task::{Poll, Waker};
+use std::{cell::RefCell, future::Future};
+use std::{marker::PhantomData, sync::RwLock};
+use std::{rc::Rc, sync::Mutex};
 
 use async_task::Runnable;
-use concurrent_queue::ConcurrentQueue;
 use futures_lite::{future, prelude::*};
+use taskqueue::{GlobalQueue, LocalQueue};
 use vec_arena::Arena;
 
 #[doc(no_inline)]
@@ -165,8 +166,8 @@ impl<'a> Executor<'a> {
     /// ```
     pub fn try_tick(&self) -> bool {
         match self.state().queue.pop() {
-            Err(_) => false,
-            Ok(runnable) => {
+            None => false,
+            Some(runnable) => {
                 // Notify another ticker now to pick up where this ticker left off, just in case
                 // running the task takes a long time.
                 self.state().notify();
@@ -198,7 +199,7 @@ impl<'a> Executor<'a> {
     /// future::block_on(ex.tick()); // runs the task
     /// ```
     pub async fn tick(&self) {
-        let state = self.state();
+        let state = self.state().clone();
         let runnable = Ticker::new(state).runnable().await;
         runnable.run();
     }
@@ -219,8 +220,9 @@ impl<'a> Executor<'a> {
     /// assert_eq!(res, 6);
     /// ```
     pub async fn run<T>(&self, future: impl Future<Output = T>) -> T {
-        let runner = Runner::new(self.state());
-
+        let runner = Runner::new(self.state().clone());
+        runner.set_tls_active();
+        let _guard = CallOnDrop(clear_tls);
         // A future that runs tasks forever.
         let run_forever = async {
             loop {
@@ -240,10 +242,14 @@ impl<'a> Executor<'a> {
     fn schedule(&self) -> impl Fn(Runnable) + Send + Sync + 'static {
         let state = self.state().clone();
 
-        // TODO(stjepang): If possible, push into the current local queue and notify the ticker.
+        let task_id = fastrand::u64(0..u64::MAX);
+        // Try to push to the local queue. If it doesn't work, push to the global queue.
         move |runnable| {
-            state.queue.push(runnable).unwrap();
-            state.notify();
+            // eprintln!("scheduling task {}", task_id);
+            if let Err(runnable) = try_push_tls(&state, task_id, runnable) {
+                state.queue.push(runnable);
+                state.notify();
+            }
         }
     }
 
@@ -264,7 +270,7 @@ impl Drop for Executor<'_> {
             }
             drop(active);
 
-            while state.queue.pop().is_ok() {}
+            while state.queue.pop().is_some() {}
         }
     }
 }
@@ -440,16 +446,17 @@ impl<'a> LocalExecutor<'a> {
     /// Returns a function that schedules a runnable task when it gets woken up.
     fn schedule(&self) -> impl Fn(Runnable) + Send + Sync + 'static {
         let state = self.inner().state().clone();
+        let task_id = fastrand::usize(0..usize::MAX);
 
         move |runnable| {
-            state.queue.push(runnable).unwrap();
+            state.queue.push(runnable);
             state.notify();
         }
     }
 
     /// Returns a reference to the inner executor.
     fn inner(&self) -> &Executor<'a> {
-        self.inner.get_or_init(|| Executor::new())
+        self.inner.get_or_init(Executor::new)
     }
 }
 
@@ -463,16 +470,16 @@ impl<'a> Default for LocalExecutor<'a> {
 #[derive(Debug)]
 struct State {
     /// The global queue.
-    queue: ConcurrentQueue<Runnable>,
+    queue: GlobalQueue,
 
     /// Local queues created by runners.
-    local_queues: RwLock<Vec<Arc<ConcurrentQueue<Runnable>>>>,
+    local_queues: RwLock<Vec<Arc<LocalQueue>>>,
 
     /// Set to `true` when a sleeping ticker is notified or no tickers are sleeping.
     notified: AtomicBool,
 
     /// A list of sleeping tickers.
-    sleepers: Mutex<Sleepers>,
+    sleepers: parking_lot::Mutex<Sleepers>,
 
     /// Currently active tasks.
     active: Mutex<Arena<Waker>>,
@@ -482,10 +489,10 @@ impl State {
     /// Creates state for a new executor.
     fn new() -> State {
         State {
-            queue: ConcurrentQueue::unbounded(),
+            queue: GlobalQueue::default(),
             local_queues: RwLock::new(Vec::new()),
             notified: AtomicBool::new(true),
-            sleepers: Mutex::new(Sleepers {
+            sleepers: parking_lot::Mutex::new(Sleepers {
                 count: 0,
                 wakers: Vec::new(),
                 free_ids: Vec::new(),
@@ -502,7 +509,7 @@ impl State {
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
         {
-            let waker = self.sleepers.lock().unwrap().notify();
+            let waker = self.sleepers.lock().notify();
             if let Some(w) = waker {
                 w.wake();
             }
@@ -557,17 +564,17 @@ impl Sleepers {
     /// Removes a previously inserted sleeping ticker.
     ///
     /// Returns `true` if the ticker was notified.
-    fn remove(&mut self, id: usize) -> bool {
+    fn remove(&mut self, id: usize) -> Option<Waker> {
         self.count -= 1;
         self.free_ids.push(id);
 
         for i in (0..self.wakers.len()).rev() {
             if self.wakers[i].0 == id {
-                self.wakers.remove(i);
-                return false;
+                let (_, waker) = self.wakers.remove(i);
+                return Some(waker);
             }
         }
-        true
+        None
     }
 
     /// Returns `true` if a sleeping ticker is notified or no tickers are sleeping.
@@ -589,9 +596,9 @@ impl Sleepers {
 
 /// Runs task one by one.
 #[derive(Debug)]
-struct Ticker<'a> {
+struct Ticker {
     /// The executor state.
-    state: &'a State,
+    state: Arc<State>,
 
     /// Set to a non-zero sleeper ID when in sleeping state.
     ///
@@ -602,9 +609,9 @@ struct Ticker<'a> {
     sleeping: AtomicUsize,
 }
 
-impl Ticker<'_> {
+impl Ticker {
     /// Creates a ticker.
-    fn new(state: &State) -> Ticker<'_> {
+    fn new(state: Arc<State>) -> Ticker {
         Ticker {
             state,
             sleeping: AtomicUsize::new(0),
@@ -615,7 +622,7 @@ impl Ticker<'_> {
     ///
     /// Returns `false` if the ticker was already sleeping and unnotified.
     fn sleep(&self, waker: &Waker) -> bool {
-        let mut sleepers = self.state.sleepers.lock().unwrap();
+        let mut sleepers = self.state.sleepers.lock();
 
         match self.sleeping.load(Ordering::SeqCst) {
             // Move to sleeping state.
@@ -639,21 +646,24 @@ impl Ticker<'_> {
     }
 
     /// Moves the ticker into woken state.
-    fn wake(&self) {
+    fn wake(&self) -> Option<Waker> {
         let id = self.sleeping.swap(0, Ordering::SeqCst);
         if id != 0 {
-            let mut sleepers = self.state.sleepers.lock().unwrap();
-            sleepers.remove(id);
+            let mut sleepers = self.state.sleepers.lock();
+            let toret = sleepers.remove(id);
 
             self.state
                 .notified
                 .swap(sleepers.is_notified(), Ordering::SeqCst);
+            toret
+        } else {
+            None
         }
     }
 
     /// Waits for the next runnable task to run.
     async fn runnable(&self) -> Runnable {
-        self.runnable_with(|| self.state.queue.pop().ok()).await
+        self.runnable_with(|| self.state.queue.pop()).await
     }
 
     /// Waits for the next runnable task to run, given a function that searches for a task.
@@ -685,13 +695,13 @@ impl Ticker<'_> {
     }
 }
 
-impl Drop for Ticker<'_> {
+impl Drop for Ticker {
     fn drop(&mut self) {
         // If this ticker is in sleeping state, it must be removed from the sleepers list.
         let id = self.sleeping.swap(0, Ordering::SeqCst);
         if id != 0 {
-            let mut sleepers = self.state.sleepers.lock().unwrap();
-            let notified = sleepers.remove(id);
+            let mut sleepers = self.state.sleepers.lock();
+            let notified = sleepers.remove(id).is_none();
 
             self.state
                 .notified
@@ -706,31 +716,68 @@ impl Drop for Ticker<'_> {
     }
 }
 
+struct TlsData {
+    state: Arc<State>,
+    ticker: Arc<Ticker>,
+    local_queue: Arc<LocalQueue>,
+}
+
+thread_local! {
+    static TLS: RefCell<Option<TlsData>> = Default::default()
+}
+
+fn clear_tls() {
+    TLS.with(|v| *v.borrow_mut() = Default::default())
+}
+
+fn try_push_tls(state: &Arc<State>, task_id: u64, runnable: Runnable) -> Result<(), Runnable> {
+    TLS.with(|tls| {
+        let tls = tls.borrow();
+        if let Some(tlsdata) = tls.as_ref() {
+            if !Arc::ptr_eq(state, &tlsdata.state) {
+                return Err(runnable);
+            }
+            if let Err(err) = tlsdata.local_queue.push(task_id, runnable) {
+                return Err(err);
+            }
+            // notify ticker
+            // eprintln!("successfully pushed locally");
+            if let Some(v) = tlsdata.ticker.wake() {
+                v.wake()
+            }
+            Ok(())
+        } else {
+            // eprintln!("WARNING! CANNOT PUSH TO TLS");
+            Err(runnable)
+        }
+    })
+}
+
 /// A worker in a work-stealing executor.
 ///
 /// This is just a ticker that also has an associated local queue for improved cache locality.
 #[derive(Debug)]
-struct Runner<'a> {
+struct Runner {
     /// The executor state.
-    state: &'a State,
+    state: Arc<State>,
 
     /// Inner ticker.
-    ticker: Ticker<'a>,
+    ticker: Arc<Ticker>,
 
     /// The local queue.
-    local: Arc<ConcurrentQueue<Runnable>>,
+    local: Arc<LocalQueue>,
 
     /// Bumped every time a runnable task is found.
     ticks: AtomicUsize,
 }
 
-impl Runner<'_> {
+impl Runner {
     /// Creates a runner and registers it in the executor state.
-    fn new(state: &State) -> Runner<'_> {
+    fn new(state: Arc<State>) -> Runner {
         let runner = Runner {
-            state,
-            ticker: Ticker::new(state),
-            local: Arc::new(ConcurrentQueue::bounded(512)),
+            state: state.clone(),
+            ticker: Arc::new(Ticker::new(state.clone())),
+            local: Arc::new(LocalQueue::default()),
             ticks: AtomicUsize::new(0),
         };
         state
@@ -741,21 +788,48 @@ impl Runner<'_> {
         runner
     }
 
+    /// Sets as active in the TLS
+    fn set_tls_active(&self) {
+        // let weak_ticker = Arc::downgrade(&self.ticker);
+        // let weak_local = Arc::downgrade(&self.local);
+        TLS.with(|tls| {
+            let mut tls = tls.borrow_mut();
+            if tls.is_none() {
+                *tls = Some(TlsData {
+                    state: self.state.clone(),
+                    ticker: self.ticker.clone(),
+                    local_queue: self.local.clone(),
+                })
+            }
+        })
+    }
+
     /// Waits for the next runnable task to run.
     async fn runnable(&self) -> Runnable {
+        // static STEALING_COUNT: AtomicUsize = AtomicUsize::new(0);
+
         let runnable = self
             .ticker
             .runnable_with(|| {
                 // Try the local queue.
-                if let Ok(r) = self.local.pop() {
+                if let Some(r) = self.local.pop() {
                     return Some(r);
                 }
 
                 // Try stealing from the global queue.
-                if let Ok(r) = self.state.queue.pop() {
-                    steal(&self.state.queue, &self.local);
+                if let Some(r) = self.state.queue.pop() {
+                    self.local.steal_global(&self.state.queue);
                     return Some(r);
                 }
+
+                // let steal_count = STEALING_COUNT.fetch_add(1, Ordering::Relaxed);
+                // let _guard = CallOnDrop(|| {
+                //     STEALING_COUNT.fetch_sub(1, Ordering::Relaxed);
+                // });
+                // // limit steal contention on many-cpued systems
+                // if steal_count > 4 {
+                //     return None;
+                // }
 
                 // Try stealing from other runners.
                 let local_queues = self.state.local_queues.read().unwrap();
@@ -774,8 +848,8 @@ impl Runner<'_> {
 
                 // Try stealing from each local queue in the list.
                 for local in iter {
-                    steal(local, &self.local);
-                    if let Ok(r) = self.local.pop() {
+                    self.local.steal_local(local);
+                    if let Some(r) = self.local.pop() {
                         return Some(r);
                     }
                 }
@@ -785,18 +859,18 @@ impl Runner<'_> {
             .await;
 
         // Bump the tick counter.
-        let ticks = self.ticks.fetch_add(1, Ordering::SeqCst);
+        let ticks = self.ticks.fetch_add(1, Ordering::Relaxed);
 
         if ticks % 64 == 0 {
             // Steal tasks from the global queue to ensure fair task scheduling.
-            steal(&self.state.queue, &self.local);
+            self.local.steal_global(&self.state.queue)
         }
 
         runnable
     }
 }
 
-impl Drop for Runner<'_> {
+impl Drop for Runner {
     fn drop(&mut self) {
         // Remove the local queue.
         self.state
@@ -806,34 +880,11 @@ impl Drop for Runner<'_> {
             .retain(|local| !Arc::ptr_eq(local, &self.local));
 
         // Re-schedule remaining tasks in the local queue.
-        while let Ok(r) = self.local.pop() {
+        while let Some(r) = self.local.pop() {
             r.schedule();
         }
     }
 }
-
-/// Steals some items from one queue into another.
-fn steal<T>(src: &ConcurrentQueue<T>, dest: &ConcurrentQueue<T>) {
-    // Half of `src`'s length rounded up.
-    let mut count = (src.len() + 1) / 2;
-
-    if count > 0 {
-        // Don't steal more than fits into the queue.
-        if let Some(cap) = dest.capacity() {
-            count = count.min(cap - dest.len());
-        }
-
-        // Steal tasks.
-        for _ in 0..count {
-            if let Ok(t) = src.pop() {
-                assert!(dest.push(t).is_ok());
-            } else {
-                break;
-            }
-        }
-    }
-}
-
 /// Runs a closure when dropped.
 struct CallOnDrop<F: Fn()>(F);
 
